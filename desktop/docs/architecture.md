@@ -109,7 +109,7 @@ subscribes to broker relays after `app:ready`, and converts backend responses
 into stable UI contracts.
 
 Electron reports the service connected after broker `app:ready`. The
-broker-owned Ollama and LM Studio proxies remain asynchronous capabilities; a
+broker-owned engine proxies remain asynchronous capabilities; a
 late or failed proxy does not misreport the broker startup as failed. If
 `app:ready` does not arrive within the startup deadline, Overview opens Settings
 
@@ -227,7 +227,7 @@ ordinary environment assignments can be edited locally or by a pinned peer.
 authoritative settings operation rather than forwarding to the engine manager,
 so both entry points validate, restart, and persist identically.
 
-The Ollama and LM Studio proxies are cluster-aware. For model-bearing inference,
+All engine proxies are cluster-aware. For model-bearing inference,
 each proxy first keeps only nodes whose per-engine discovery inventory advertises
 the requested model. Empty and non-matching inventories are excluded; an empty
 owner set returns a local `502`. Routing precedence within the eligible set is:
@@ -236,7 +236,7 @@ owner set returns a local `502`. Routing precedence within the eligible set is:
 2. the priority list emitted by `nvpair-job-scheduler`;
 3. the proxy's deterministic default ordering.
 
-The scheduler combines total pending (queued and running) workload across both
+The scheduler combines total pending (queued and running) workload across all
 engines with a smoothed 0–3 pressure derived from the busiest GPU. Missing,
 invalid, or older-than-10-second telemetry has neutral pressure. It emits the
 order, pending count, and pressure, reranking on meaningful workload, discovery,
@@ -250,7 +250,8 @@ not select or pin proxy routes.
 An NVPAIR-launched engine binds to loopback and is never directly LAN-reachable.
 Peers reach it only through the node's proxy over a cluster-mTLS ingress, so
 discovery advertises the promoted proxy port for `ol`/`lm` rather than the
-engine's private port. This transport security is backend-owned; Electron only
+engine's private port; llama.cpp uses the additional `lc` key. Transport
+security is backend-owned; Electron only
 reflects the advertised proxy port and reads a remote engine's real port from
 `engine:remote-get-installed` facts.
 
@@ -269,6 +270,12 @@ same method, so both front ends browse one implementation.
   callers coalesced onto one request and a failure backoff. The cache is warmed
   when the Overview renderer reports ready, not when the service connects, so a
   slow or hanging catalog fetch cannot compete with the window's first paint;
+- llama.cpp models come from the 50 most-downloaded GGUF repositories of each
+  approved publisher (`ggml-org`, `bartowski`, and `unsloth`), fetched and cached
+  the same way. It is the one searchable source: a `query` searches up to 50
+  public Hugging Face matches across publishers, each query cached on its own.
+  Both keep only public, generative repositories with a primary `Q4_K_M` file
+  and emit exact `owner/repository:Q4_K_M` pull IDs;
 - the request takes an optional `platform` and `arch`, marks Apple-only (MLX)
   rows, keeps them only for Apple Silicon, and echoes the target it filtered
   for, so a client driving a peer is not offered models that peer cannot

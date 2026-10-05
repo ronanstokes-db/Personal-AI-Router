@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -536,6 +537,91 @@ func TestHandleHTTP_AggregatesOpenAIModelList(t *testing.T) {
 	})
 }
 
+func TestHandleHTTP_LlamaCPPModelListsAggregateFleet(t *testing.T) {
+	for _, path := range []string{"/models", "/v1/models"} {
+		t.Run(path, func(t *testing.T) {
+			profile, ok := profileFor("llamacpp")
+			if !ok {
+				t.Fatal("llamacpp profile missing")
+			}
+			serve := func(body string, hits *atomic.Int32) *httptest.Server {
+				t.Helper()
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits.Add(1)
+					if r.Method != http.MethodGet || r.URL.Path != "/models" || r.URL.RawQuery != "scope=all" {
+						t.Errorf("upstream request = %s %s?%s, want GET /models?scope=all", r.Method, r.URL.Path, r.URL.RawQuery)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if _, err := io.WriteString(w, body); err != nil {
+						t.Errorf("write model list: %v", err)
+					}
+				}))
+				t.Cleanup(server.Close)
+				return server
+			}
+			var aHits, bHits atomic.Int32
+			a := serve(`{"object":"list","data":[{"id":"a","owned_by":"a"},{"id":"shared","owned_by":"first"}]}`, &aHits)
+			b := serve(`{"object":"list","data":[{"id":"shared","owned_by":"second"},{"id":"c","owned_by":"b"}]}`, &bHits)
+			disc := NewDiscovery()
+			disc.AddManual(nodeFor(t, "a", a.URL))
+			disc.AddManual(nodeFor(t, "b", b.URL))
+			f := testProxy(profile, disc, profile.FacadePort).soleFacade()
+			f.SetSelected("a")
+			rec := httptest.NewRecorder()
+			f.handleHTTP(rec, httptest.NewRequest(http.MethodGet, path+"?scope=all", nil))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("model list status = %d, want %d", rec.Code, http.StatusOK)
+			}
+			var got struct {
+				Object string `json:"object"`
+				Data   []struct {
+					ID      string `json:"id"`
+					OwnedBy string `json:"owned_by"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode model list: %v", err)
+			}
+			if got.Object != "list" || len(got.Data) != 3 {
+				t.Fatalf("model list = %+v, want list envelope with three deduplicated models", got)
+			}
+			if got.Data[0].ID != "a" || got.Data[1].ID != "shared" || got.Data[1].OwnedBy != "first" || got.Data[2].ID != "c" {
+				t.Fatalf("models = %+v, want a, shared(first), c", got.Data)
+			}
+			if aHits.Load() != 1 || bHits.Load() != 1 {
+				t.Fatalf("upstream requests: a=%d, b=%d, want one per node despite selecting a", aHits.Load(), bHits.Load())
+			}
+		})
+	}
+}
+
+func TestHandleHTTP_ModelListRemapsUpstreamPath(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/models" || r.URL.RawQuery != "scope=all" {
+			t.Errorf("upstream request = %s %s?%s, want GET /models?scope=all", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		_, _ = io.WriteString(w, `{"data":[{"id":"remapped"}]}`)
+	}))
+	defer upstream.Close()
+
+	profile := lmstudioCase(t).profile
+	profile.Routes = []route{{
+		Path:         "/v1/models",
+		UpstreamPath: "/models",
+		Role:         roleModelListOpenAIGET,
+	}}
+	disc := NewDiscovery()
+	disc.AddManual(nodeFor(t, "remapped", upstream.URL))
+	rec := httptest.NewRecorder()
+	testProxy(profile, disc, profile.FacadePort).soleFacade().
+		handleHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models?scope=all", nil))
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"id":"remapped"`) {
+		t.Fatalf("response = %d %s, want remapped model list", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleHTTP_ModelListEmptyAndUnavailable(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, tc engineCase) {
 		serveEmpty := func() *httptest.Server {
@@ -639,6 +725,87 @@ func TestHandleHTTP_StrictModelRouting(t *testing.T) {
 			t.Fatalf("non-inference hits miss=%d unknown=%d match=%d, want 1/0/1", missHits, unknownHits, matchHits)
 		}
 	})
+}
+
+// TestHandleHTTP_InferenceRouting proves each engine inference route is
+// model-routed, retries a model-not-found response, and
+// forwards the request path and body unchanged.
+func TestHandleHTTP_InferenceRouting(t *testing.T) {
+	test := func(name, path string, profiles ...engineProfile) {
+		t.Run(name, func(t *testing.T) {
+			for _, profile := range profiles {
+				t.Run(profile.Name, func(t *testing.T) {
+					requestedModel := "requested-model"
+					advertisedModel := profile.normalizeModel(requestedModel)
+
+					wrongModel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						t.Error("wrong-model node should not receive request")
+						w.WriteHeader(http.StatusOK)
+					}))
+					defer wrongModel.Close()
+
+					missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						w.WriteHeader(http.StatusNotFound)
+						if _, err := io.WriteString(w, `{"error":"model not found"}`); err != nil {
+							t.Errorf("write missing-model response: %v", err)
+						}
+					}))
+					defer missing.Close()
+
+					var gotBody string
+					var gotPath string
+					good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						body, err := io.ReadAll(r.Body)
+						if err != nil {
+							t.Errorf("read forwarded request body: %v", err)
+							w.WriteHeader(http.StatusInternalServerError)
+							return
+						}
+						gotBody = string(body)
+						gotPath = r.URL.Path
+						w.WriteHeader(http.StatusOK)
+					}))
+					defer good.Close()
+
+					disc := NewDiscovery()
+					disc.AddManual(nodeForModel(t, "wrong", wrongModel.URL, "different-model"))
+					disc.AddManual(nodeForModel(t, "missing", missing.URL, advertisedModel))
+					disc.AddManual(nodeForModel(t, "good", good.URL, advertisedModel))
+					p := testProxy(profile, disc, profile.FacadePort)
+					p.soleFacade().SetSelected("wrong")
+					// Stable node ordering would send this request to "good" first and
+					// never exercise 404 failover. Prioritize "missing" so the test
+					// independently proves both model filtering and retry behavior.
+					p.SetPriority([]string{"missing", "good"})
+
+					body := `{"model":"requested-model","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}`
+					rec := httptest.NewRecorder()
+					p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+
+					if rec.Code != http.StatusOK {
+						t.Fatalf("status = %d, want 200 after 404 failover", rec.Code)
+					}
+					if gotBody != body {
+						t.Errorf("node got body %q, want %q", gotBody, body)
+					}
+					if gotPath != path {
+						t.Errorf("path = %q, want %q", gotPath, path)
+					}
+				})
+			}
+		})
+	}
+
+	ollama := ollamaCase(t).profile
+	lmstudio := lmstudioCase(t).profile
+	test("native Ollama generate", "/api/generate", ollama)
+	test("native Ollama chat", "/api/chat", ollama)
+	test("native Ollama embeddings", "/api/embeddings", ollama)
+	test("native Ollama embed", "/api/embed", ollama)
+	test("OpenAI chat completions", "/v1/chat/completions", ollama, lmstudio)
+	test("OpenAI completions", "/v1/completions", ollama, lmstudio)
+	test("OpenAI embeddings", "/v1/embeddings", ollama, lmstudio)
+	test("Anthropic messages", "/v1/messages", ollama, lmstudio)
 }
 
 func TestHandleHTTP_NoAdvertisedModelRejectsLocally(t *testing.T) {

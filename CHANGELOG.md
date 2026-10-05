@@ -11,6 +11,42 @@ published releases on GitHub.
 Builds from this repository are unsigned and configure no update feed, so
 automatic updates are unavailable in them.
 
+## 0.1.9 — Clearer in-flight jobs (#141)
+
+- Jobs that have not started yet are labeled In flight, and they and their connection lines use the same yellow as the GPU chart.
+- A job's card names the node it was sent to with "Sent to" until the job starts, including a job that fails or is cancelled before it starts, instead of "Ran on".
+
+## 0.1.8 — Retry failed scheduler priority notifications (#122)
+
+- The scheduler retries changed priorities after a failed local notification write and keeps its status aligned with the last successful delivery.
+
+## 0.1.7 — Workload broadcast reliability: ordered broadcasts, dedup after emit (#80)
+
+- Inter-node workload broadcasts are now serialized in origin order, so a lifecycle remove can no longer overtake its own upsert on a peer and resurrect a ghost workload.
+- Dedup keys are recorded only after the broker emit succeeds; a failed emit's retry is no longer swallowed as a duplicate.
+
+## 0.1.6 — The app is now called NVIDIA PAIR (#132)
+
+- The desktop app, tray, shortcuts, and installer now show the name NVIDIA PAIR.
+- Installed programs lists show NVIDIA Corporation as the publisher.
+- Existing installs keep their settings, engines, cluster membership, and firewall rules when they update.
+
+## 0.1.5 — Avoid unnecessary cluster trust notifications (#62)
+
+- Cluster trust notifications now follow successfully saved peer endorsements. Duplicate endorsements and failed writes no longer cause unnecessary refreshes.
+
+## 0.1.4 — Fix HTTP connection reuse in engine health probes (#37)
+
+- Periodic engine monitoring now reuses HTTP/1 connections instead of opening a new connection for every health probe.
+
+## 0.1.3 — Route Anthropic Messages API requests (#27)
+
+- The Ollama and LM Studio endpoints offered by PAIR now accept requests for the Anthropic Messages API via POST to the /v1/messages endpoint and direct them to the owner of the requested model, just as happens with the other inference methods.
+
+## 0.1.2 — fix(mdns): send responses from UDP 5353 (GitHub Issue #1) (#102)
+
+- Discovery traffic now originates from UDP 5353, allowing standards-compliant mDNS peers and network reflectors to accept PAIR node records.
+
 ## 0.1.1
 
 ### Fixed
